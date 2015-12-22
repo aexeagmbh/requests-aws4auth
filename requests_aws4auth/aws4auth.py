@@ -24,8 +24,7 @@ except ImportError:
     from urllib import quote, unquote
 
 from requests.auth import AuthBase
-from .six import PY2, text_type, u
-from .aws4signingkey import AWS4SigningKey
+from .six import PY2, text_type
 
 
 class AWS4Auth(AuthBase):
@@ -65,11 +64,9 @@ class AWS4Auth(AuthBase):
     ----------------
 
     AWS4Auth.access_id   -- the access ID supplied to the instance
+    AWS4Auth.access_key  -- the access key supplied to the instance
     AWS4Auth.region      -- the AWS region for the instance
     AWS4Auth.service     -- the endpoint code for the service for this instance
-    AWS4Auth.signing_key -- instance of AWS4SigningKey used for this instance,
-                            either generated from the supplied parameters or
-                            supplied directly on the command line
 
    """
 
@@ -78,13 +75,9 @@ class AWS4Auth(AuthBase):
     def __init__(self, *args, **kwargs):
         """
         AWS4Auth instances can be created by supplying scoping parameters
-        directly or by using a pre-generated signing key:
+        directly:
 
         >>> auth = AWS4Auth(access_id, access_key, region, service)
-
-          or
-
-        >>> auth = AWS4Auth(access_id, signing_key)
 
         access_id  -- This is your AWS access ID
         access_key -- This is your AWS access key
@@ -96,36 +89,24 @@ class AWS4Auth(AuthBase):
                       endpoints at:
                       http://docs.aws.amazon.com/general/latest/gr/rande.html
                       e.g. elasticbeanstalk.
-        signing_key - An AWS4SigningKey instance.
 
-        All arguments except signing_key should be supplied as strings.
+        All arguments should be supplied as strings.
 
         """
-        l = len(args)
-        if l not in [2, 4]:
-            msg = 'AWS4Auth() takes 2 or 4 arguments, {} given'.format(l)
+        if not len(args) == 4:
+            msg = 'AWS4Auth() takes 2 or 4 arguments, {} given'.format(len(args))
             raise TypeError(msg)
+
         self.access_id = args[0]
-        if isinstance(args[1], AWS4SigningKey) and len(args) == 2:
-            # instantiate from signing key
-            key = args[1]
-            self.region = key.region
-            self.service = key.service
-            self.signing_key = key
-        elif len(args) == 4:
-            # instantiate from args
-            access_key = args[1]
-            self.region = args[2]
-            self.service = args[3]
-            self.signing_key = AWS4SigningKey(access_key,
-                                              self.region,
-                                              self.service)
-        else:
-            raise TypeError()
+        self.access_key = args[1]
+        self.region = args[2]
+        self.service = args[3]
+
         if 'include_hdrs' in kwargs:
             self.include_hdrs = kwargs[str('include_hdrs')]
         else:
             self.include_hdrs = self.default_include_headers
+
         AuthBase.__init__(self)
 
     def __call__(self, req):
@@ -149,26 +130,38 @@ class AWS4Auth(AuthBase):
             content_hash = hashlib.sha256(b'')
 
         req.headers['x-amz-content-sha256'] = content_hash.hexdigest()
-        now = datetime.utcnow()
         if 'x-amz-date' not in req.headers:
-            timestamp = now.strftime('%Y%m%dT%H%M%SZ')
-            req.headers['x-amz-date'] = timestamp
+            req.headers['x-amz-date'] = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+
+        amz_date = req.headers['x-amz-date'].split('T', 1)[0]
+        scope = self.get_scope(amz_date)
         result = self.get_canonical_headers(req, self.include_hdrs)
         cano_headers, signed_headers = result
-        cano_req = self.get_canonical_request(req, cano_headers,
-                                              signed_headers)
-        self.signing_key.set_date(now.strftime('%Y%m%d'))
-        sig_string = self.get_sig_string(req, cano_req, self.signing_key.scope)
+        cano_req = self.get_canonical_request(req, cano_headers, signed_headers)
+        sig_string = self.get_sig_string(req, cano_req, scope)
         sig_string = sig_string.encode('utf-8')
-        hsh = hmac.new(self.signing_key.key, sig_string, hashlib.sha256)
+        hsh = hmac.new(self.generate_key(amz_date), sig_string, hashlib.sha256)
         sig = hsh.hexdigest()
         auth_str = 'AWS4-HMAC-SHA256 '
-        auth_str += 'Credential={}/{}, '.format(self.access_id,
-                                                self.signing_key.scope)
+        auth_str += 'Credential={}/{}, '.format(self.access_id, scope)
         auth_str += 'SignedHeaders={}, '.format(signed_headers)
         auth_str += 'Signature={}'.format(sig)
         req.headers['Authorization'] = auth_str
         return req
+
+    @staticmethod
+    def sign_sha256(key, msg):
+        """
+        Generate an SHA256 HMAC, encoding msg to UTF-8 if not
+        already encoded.
+
+        key -- signing key. bytes.
+        msg -- message to sign. unicode or bytes.
+
+        """
+        if isinstance(msg, text_type):
+            msg = msg.encode('utf-8')
+        return hmac.new(key, msg, hashlib.sha256).digest()
 
     @staticmethod
     def encode_body(req):
@@ -198,6 +191,35 @@ class AWS4Auth(AuthBase):
                 else:
                     req.body = req.body.encode('utf-8')
                     req.headers['content-type'] = ct + '; charset=utf-8'
+
+    def generate_key(self, date, intermediate=False):
+        """
+        Generate the signing key string as bytes.
+
+        If intermediate is set to True, returns a 4-tuple containing the key
+        and the intermediate keys:
+
+        ( signing_key, date_key, region_key, service_key )
+
+        The intermediate keys can be used for testing against example from
+        Amazon.
+
+        """
+        init_key = ('AWS4' + self.access_key).encode('utf-8')
+        date_key = self.sign_sha256(init_key, date)
+        region_key = self.sign_sha256(date_key, self.region)
+        service_key = self.sign_sha256(region_key, self.service)
+        key = self.sign_sha256(service_key, 'aws4_request')
+        if intermediate:
+            return (key, date_key, region_key, service_key)
+        else:
+            return key
+
+    def get_scope(self, date):
+        return '{}/{}/{}/aws4_request'.format(
+            date,
+            self.region,
+            self.service)
 
     def get_canonical_request(self, req, cano_headers, signed_headers):
         """
@@ -263,7 +285,7 @@ class AWS4Auth(AuthBase):
             val = cls.amz_norm_whitespace(val).strip()
             if (hdr in include or '*' in include or
                     ('x-amz-*' in include and hdr.startswith('x-amz-') and not
-                    hdr == 'x-amz-client-context')):
+                     hdr == 'x-amz-client-context')):
                 vals = cano_headers_dict.setdefault(hdr, [])
                 vals.append(val)
         # Flatten cano_headers dict to string and generate signed_headers
